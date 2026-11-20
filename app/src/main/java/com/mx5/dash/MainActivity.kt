@@ -30,6 +30,7 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.Locale
 import java.util.UUID
 import kotlin.math.sin
 
@@ -78,10 +79,11 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
     var showDevices by remember { mutableStateOf(false) }
 
     var rpm by remember { mutableIntStateOf(0) }
-    var speed by remember { mutableIntStateOf(0) }
     var coolantTemp by remember { mutableIntStateOf(0) }
+    var oilTemp by remember { mutableIntStateOf(-999) }
+    var kmPerLiter by remember { mutableDoubleStateOf(0.0) }
+    var throttlePos by remember { mutableIntStateOf(0) }
     var intakeTemp by remember { mutableIntStateOf(0) }
-    var voltage by remember { mutableDoubleStateOf(0.0) }
     var engineLoad by remember { mutableIntStateOf(0) }
 
     var obdJob by remember { mutableStateOf<Job?>(null) }
@@ -105,11 +107,12 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
             while (isActive) {
                 t += 0.15
                 rpm = (3200 + 2800 * sin(t)).toInt().coerceIn(850, 6500)
-                speed = (rpm / 45).coerceIn(0, 180)
-                coolantTemp = (88 + 4 * sin(t * 0.2)).toInt()
+                coolantTemp = (89 + 4 * sin(t * 0.2)).toInt()
+                oilTemp = (96 + 5 * sin(t * 0.15)).toInt()
+                kmPerLiter = (13.5 + 5.5 * sin(t * 0.4)).coerceIn(3.5, 28.0)
+                throttlePos = (35 + 30 * sin(t)).toInt().coerceIn(13, 86)
                 intakeTemp = (26 + 3 * sin(t * 0.1)).toInt()
-                voltage = 14.1 + 0.2 * sin(t * 0.3)
-                engineLoad = (45 + 35 * sin(t)).toInt().coerceIn(10, 95)
+                engineLoad = (45 + 35 * sin(t)).toInt().coerceIn(12, 95)
                 delay(80)
             }
         }
@@ -117,7 +120,7 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
 
     fun connectObd(device: BluetoothDevice) {
         stopAll()
-        statusText = "Connessione a ${device.name}..."
+        statusText = "Connessione..."
         obdJob = scope.launch(Dispatchers.IO) {
             try {
                 btAdapter?.cancelDiscovery()
@@ -127,7 +130,7 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
                 val input = socket.inputStream
                 val output = socket.outputStream
 
-                statusText = "Inizializzazione ECU Mazda..."
+                statusText = "Init ECU Mazda..."
                 sendCommand(output, input, "ATZ", 600)
                 sendCommand(output, input, "ATE0", 150)
                 sendCommand(output, input, "ATL0", 150)
@@ -135,30 +138,70 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
                 sendCommand(output, input, "ATSP6", 200)
 
                 isConnected = true
-                statusText = "Connesso: ${device.name}"
+                statusText = "Connesso"
+
+                var useExtendedOilPid = true
 
                 while (isActive) {
-                    parseResponse(sendCommand(output, input, "010C", 45))?.let { bytes ->
-                        if (bytes.size >= 4) rpm = ((bytes[2] * 256) + bytes[3]) / 4
+                    // 1. Giri Motore (010C)
+                    parseMode01(sendCommand(output, input, "010C", 40))?.let { b ->
+                        if (b.size >= 4) rpm = ((b[2] * 256) + b[3]) / 4
                     }
-                    parseResponse(sendCommand(output, input, "0105", 45))?.let { bytes ->
-                        if (bytes.size >= 3) coolantTemp = bytes[2] - 40
+
+                    // 2. Temperatura Acqua (0105)
+                    parseMode01(sendCommand(output, input, "0105", 40))?.let { b ->
+                        if (b.size >= 3) coolantTemp = b[2] - 40
                     }
-                    parseResponse(sendCommand(output, input, "010D", 45))?.let { bytes ->
-                        if (bytes.size >= 3) speed = bytes[2]
+
+                    // 3. Apertura Farfalla (0111)
+                    parseMode01(sendCommand(output, input, "0111", 40))?.let { b ->
+                        if (b.size >= 3) throttlePos = (b[2] * 100) / 255
                     }
-                    parseResponse(sendCommand(output, input, "0142", 45))?.let { bytes ->
-                        if (bytes.size >= 4) voltage = ((bytes[2] * 256) + bytes[3]) / 1000.0
+
+                    // 4. Consumo Istantaneo (Velocità 010D + MAF 0110)
+                    var currentSpeed = 0
+                    var mafGramsSec = 0.0
+                    parseMode01(sendCommand(output, input, "010D", 40))?.let { b ->
+                        if (b.size >= 3) currentSpeed = b[2]
                     }
-                    parseResponse(sendCommand(output, input, "010F", 45))?.let { bytes ->
-                        if (bytes.size >= 3) intakeTemp = bytes[2] - 40
+                    parseMode01(sendCommand(output, input, "0110", 40))?.let { b ->
+                        if (b.size >= 4) mafGramsSec = ((b[2] * 256) + b[3]) / 100.0
                     }
-                    parseResponse(sendCommand(output, input, "0104", 45))?.let { bytes ->
-                        if (bytes.size >= 3) engineLoad = (bytes[2] * 100) / 255
+                    kmPerLiter = if (currentSpeed > 2 && mafGramsSec > 0.1) {
+                        val litersPerHour = mafGramsSec * 0.3287
+                        (currentSpeed / litersPerHour).coerceIn(0.0, 50.0)
+                    } else {
+                        0.0
+                    }
+
+                    // 5. Temperatura Aria Aspirata IAT (010F)
+                    parseMode01(sendCommand(output, input, "010F", 40))?.let { b ->
+                        if (b.size >= 3) intakeTemp = b[2] - 40
+                    }
+
+                    // 6. Carico Motore (0104)
+                    parseMode01(sendCommand(output, input, "0104", 40))?.let { b ->
+                        if (b.size >= 3) engineLoad = (b[2] * 100) / 255
+                    }
+
+                    // 7. Temperatura Olio Motore (PID Mazda 221310 o Standard 015C)
+                    if (useExtendedOilPid) {
+                        val rawOil = sendCommand(output, input, "221310", 45)
+                        val parsedExt = parseMode22(rawOil, "621310")
+                        if (parsedExt != null && parsedExt.size >= 4) {
+                            val valC = ((parsedExt[3] * 256) + (parsedExt.getOrElse(4) { 0 })) / 100
+                            oilTemp = if (valC in -20..180) valC else (parsedExt[3] - 40)
+                        } else {
+                            useExtendedOilPid = false
+                        }
+                    } else {
+                        parseMode01(sendCommand(output, input, "015C", 40))?.let { b ->
+                            if (b.size >= 3) oilTemp = b[2] - 40
+                        }
                     }
                 }
             } catch (e: Exception) {
-                statusText = "Errore: ${e.localizedMessage ?: "Connessione fallita"}"
+                statusText = "Errore BT"
                 isConnected = false
             }
         }
@@ -174,40 +217,55 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
         coolantTemp >= 102 -> Color(0xFFFF1744)
         coolantTemp >= 96 -> Color(0xFFFFAB00)
         coolantTemp in 1..65 -> Color(0xFF29B6F6)
-        else -> Color.White
+        else -> Color(0xFF80D8FF)
+    }
+    val oilColor = when {
+        oilTemp >= 120 -> Color(0xFFFF1744)
+        oilTemp >= 110 -> Color(0xFFFFAB00)
+        oilTemp in 1..65 -> Color(0xFF29B6F6)
+        else -> Color(0xFFFF9100)
     }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .padding(12.dp),
-        verticalArrangement = Arrangement.SpaceBetween
+            .padding(horizontal = 14.dp, vertical = 18.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        // Barra superiore: Stato e pulsanti
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = "MX-5 NC1  |  $statusText",
-                color = if (isConnected) Color(0xFF00E676) else Color(0xFFB0BEC5),
-                fontSize = 14.sp,
-                fontWeight = FontWeight.SemiBold
-            )
+            Column {
+                Text(
+                    text = "MX-5 NC1",
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = statusText,
+                    color = if (isConnected) Color(0xFF00E676) else Color(0xFF90A4AE),
+                    fontSize = 13.sp
+                )
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box {
                     Button(
                         onClick = { showDevices = true },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E88E5))
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E88E5)),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
                     ) {
-                        Text("Connetti OBD", fontSize = 12.sp)
+                        Text("Connetti", fontSize = 13.sp)
                     }
                     DropdownMenu(expanded = showDevices, onDismissRequest = { showDevices = false }) {
                         val paired = btAdapter?.bondedDevices?.toList().orEmpty()
                         if (paired.isEmpty()) {
                             DropdownMenuItem(
-                                text = { Text("Nessun dispositivo accoppiato") },
+                                text = { Text("Nessun dispositivo") },
                                 onClick = { showDevices = false }
                             )
                         } else {
@@ -227,27 +285,36 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
                     onClick = { if (isDemo || isConnected) stopAll() else startDemo() },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (isDemo || isConnected) Color(0xFFD32F2F) else Color(0xFF37474F)
-                    )
+                    ),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
                 ) {
-                    Text(if (isDemo || isConnected) "Stop" else "Demo", fontSize = 12.sp)
+                    Text(if (isDemo || isConnected) "Stop" else "Demo", fontSize = 13.sp)
                 }
             }
         }
 
-        Column(modifier = Modifier.fillMaxWidth()) {
+        // Barra LED Giri Motore
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color(0xFF101010), RoundedCornerShape(12.dp))
+                .border(1.dp, Color(0xFF262626), RoundedCornerShape(12.dp))
+                .padding(12.dp)
+        ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.Bottom
             ) {
-                Text("GIRI MOTORE", color = Color.Gray, fontSize = 12.sp)
-                Text("$rpm RPM", color = shiftColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Text("GIRI MOTORE", color = Color(0xFF90A4AE), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                Text("$rpm RPM", color = shiftColor, fontSize = 24.sp, fontWeight = FontWeight.Bold)
             }
-            Spacer(modifier = Modifier.height(4.dp))
+            Spacer(modifier = Modifier.height(8.dp))
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(22.dp)
-                    .background(Color(0xFF1A1A1A), RoundedCornerShape(6.dp))
+                    .height(24.dp)
+                    .background(Color(0xFF1E1E1E), RoundedCornerShape(6.dp))
             ) {
                 Box(
                     modifier = Modifier
@@ -258,21 +325,62 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
             }
         }
 
+        // Riga 1: Temperatura Acqua + Temperatura Olio
         Row(
-            modifier = Modifier.fillMaxWidth().weight(1f).padding(top = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            GaugeBox("ACQUA", "$coolantTemp°C", coolantColor, Modifier.weight(1f).fillMaxHeight())
-            GaugeBox("VELOCITÀ", "$speed", Color.White, Modifier.weight(1f).fillMaxHeight(), "km/h")
-            GaugeBox("BATTERIA", String.format("%.1f V", voltage), Color(0xFF81C784), Modifier.weight(1f).fillMaxHeight())
+            GaugeBox(
+                title = "TEMP. ACQUA",
+                value = "$coolantTemp°C",
+                valueColor = coolantColor,
+                modifier = Modifier.weight(1f).fillMaxHeight()
+            )
+            GaugeBox(
+                title = "TEMP. OLIO",
+                value = if (oilTemp > -100) "$oilTemp°C" else "--°C",
+                valueColor = oilColor,
+                modifier = Modifier.weight(1f).fillMaxHeight()
+            )
         }
 
+        // Riga 2: Consumo Istantaneo + Apertura Farfalla
         Row(
-            modifier = Modifier.fillMaxWidth().weight(0.85f).padding(top = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            GaugeBox("ARIA ASPIRATA (IAT)", "$intakeTemp°C", Color(0xFF4FC3F7), Modifier.weight(1f).fillMaxHeight())
-            GaugeBox("CARICO MOTORE", "$engineLoad%", Color(0xFFFFD54F), Modifier.weight(1f).fillMaxHeight())
+            GaugeBox(
+                title = "CONSUMO IST.",
+                value = if (kmPerLiter > 0.1) String.format(Locale.US, "%.1f", kmPerLiter) else "0.0",
+                valueColor = Color(0xFF00E676),
+                sub = "km/l",
+                modifier = Modifier.weight(1f).fillMaxHeight()
+            )
+            GaugeBox(
+                title = "FARFALLA",
+                value = "$throttlePos%",
+                valueColor = Color(0xFFE040FB),
+                modifier = Modifier.weight(1f).fillMaxHeight()
+            )
+        }
+
+        // Riga 3: Aria Aspirata (IAT) + Carico Motore
+        Row(
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            GaugeBox(
+                title = "ARIA ASPIRATA",
+                value = "$intakeTemp°C",
+                valueColor = Color(0xFF40C4FF),
+                modifier = Modifier.weight(1f).fillMaxHeight()
+            )
+            GaugeBox(
+                title = "CARICO MOTORE",
+                value = "$engineLoad%",
+                valueColor = Color(0xFFFFD740),
+                modifier = Modifier.weight(1f).fillMaxHeight()
+            )
         }
     }
 }
@@ -281,16 +389,17 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
 fun GaugeBox(title: String, value: String, valueColor: Color, modifier: Modifier = Modifier, sub: String = "") {
     Column(
         modifier = modifier
-            .background(Color(0xFF121212), RoundedCornerShape(10.dp))
-            .border(1.dp, Color(0xFF2C2C2C), RoundedCornerShape(10.dp))
+            .background(Color(0xFF101010), RoundedCornerShape(14.dp))
+            .border(1.dp, Color(0xFF262626), RoundedCornerShape(14.dp))
             .padding(10.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text(text = title, color = Color(0xFF90A4AE), fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        Text(text = title, color = Color(0xFF90A4AE), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(modifier = Modifier.height(6.dp))
         Text(text = value, color = valueColor, fontSize = 36.sp, fontWeight = FontWeight.Bold)
         if (sub.isNotEmpty()) {
-            Text(text = sub, color = Color.Gray, fontSize = 12.sp)
+            Text(text = sub, color = Color(0xFF78909C), fontSize = 13.sp, fontWeight = FontWeight.Medium)
         }
     }
 }
@@ -302,7 +411,7 @@ private suspend fun sendCommand(out: OutputStream, input: InputStream, cmd: Stri
     delay(waitMs)
     val sb = StringBuilder()
     val start = System.currentTimeMillis()
-    while (System.currentTimeMillis() - start < 300) {
+    while (System.currentTimeMillis() - start < 250) {
         if (input.available() > 0) {
             val c = input.read().toChar()
             if (c == '>') break
@@ -314,11 +423,23 @@ private suspend fun sendCommand(out: OutputStream, input: InputStream, cmd: Stri
     return sb.toString().replace("\\s".toRegex(), "")
 }
 
-private fun parseResponse(raw: String): List<Int>? {
+private fun parseMode01(raw: String): List<Int>? {
     val idx = raw.indexOf("41")
     if (idx == -1) return null
     val hex = raw.substring(idx)
     if (hex.length < 6) return null
+    return try {
+        hex.chunked(2).map { it.toInt(16) }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun parseMode22(raw: String, header: String): List<Int>? {
+    val idx = raw.indexOf(header)
+    if (idx == -1) return null
+    val hex = raw.substring(idx)
+    if (hex.length < 8) return null
     return try {
         hex.chunked(2).map { it.toInt(16) }
     } catch (_: Exception) {
