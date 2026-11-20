@@ -32,6 +32,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.util.Locale
 import java.util.UUID
+import kotlin.math.abs
 import kotlin.math.sin
 
 class MainActivity : ComponentActivity() {
@@ -80,8 +81,10 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
 
     var rpm by remember { mutableIntStateOf(0) }
     var coolantTemp by remember { mutableIntStateOf(0) }
-    var oilTemp by remember { mutableIntStateOf(-999) }
-    var kmPerLiter by remember { mutableDoubleStateOf(0.0) }
+    var stft by remember { mutableDoubleStateOf(0.0) }
+    var ltft by remember { mutableDoubleStateOf(0.0) }
+    var fuelValueText by remember { mutableStateOf("0.0") }
+    var fuelUnitText by remember { mutableStateOf("L/h") }
     var throttlePos by remember { mutableIntStateOf(0) }
     var intakeTemp by remember { mutableIntStateOf(0) }
     var engineLoad by remember { mutableIntStateOf(0) }
@@ -108,8 +111,11 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
                 t += 0.15
                 rpm = (3200 + 2800 * sin(t)).toInt().coerceIn(850, 6500)
                 coolantTemp = (89 + 4 * sin(t * 0.2)).toInt()
-                oilTemp = (96 + 5 * sin(t * 0.15)).toInt()
-                kmPerLiter = (13.5 + 5.5 * sin(t * 0.4)).coerceIn(3.5, 28.0)
+                stft = 3.2 * sin(t * 0.5)
+                ltft = 1.6
+                val simKml = (13.5 + 5.5 * sin(t * 0.4)).coerceIn(3.5, 28.0)
+                fuelValueText = String.format(Locale.US, "%.1f", simKml)
+                fuelUnitText = "km/l"
                 throttlePos = (35 + 30 * sin(t)).toInt().coerceIn(13, 86)
                 intakeTemp = (26 + 3 * sin(t * 0.1)).toInt()
                 engineLoad = (45 + 35 * sin(t)).toInt().coerceIn(12, 95)
@@ -140,65 +146,69 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
                 isConnected = true
                 statusText = "Connesso"
 
-                var useExtendedOilPid = true
+                var lastSpeed = 0
+                var lastMafGramsSec = 0.0
+                var loopCount = 0
 
                 while (isActive) {
                     // 1. Giri Motore (010C)
-                    parseMode01(sendCommand(output, input, "010C", 40))?.let { b ->
+                    parsePid(sendCommand(output, input, "010C", 45), "410C")?.let { b ->
                         if (b.size >= 4) rpm = ((b[2] * 256) + b[3]) / 4
                     }
 
                     // 2. Temperatura Acqua (0105)
-                    parseMode01(sendCommand(output, input, "0105", 40))?.let { b ->
+                    parsePid(sendCommand(output, input, "0105", 45), "4105")?.let { b ->
                         if (b.size >= 3) coolantTemp = b[2] - 40
                     }
 
-                    // 3. Apertura Farfalla (0111)
-                    parseMode01(sendCommand(output, input, "0111", 40))?.let { b ->
+                    // 3. Correzione Carburante Breve Termine STFT (0106)
+                    parsePid(sendCommand(output, input, "0106", 45), "4106")?.let { b ->
+                        if (b.size >= 3) stft = ((b[2] - 128) * 100.0) / 128.0
+                    }
+
+                    // 4. Correzione Carburante Lungo Termine LTFT (0107 - letta ogni 5 cicli)
+                    if (loopCount % 5 == 0) {
+                        parsePid(sendCommand(output, input, "0107", 45), "4107")?.let { b ->
+                            if (b.size >= 3) ltft = ((b[2] - 128) * 100.0) / 128.0
+                        }
+                    }
+
+                    // 5. Apertura Farfalla (0111)
+                    parsePid(sendCommand(output, input, "0111", 45), "4111")?.let { b ->
                         if (b.size >= 3) throttlePos = (b[2] * 100) / 255
                     }
 
-                    // 4. Consumo Istantaneo (Velocità 010D + MAF 0110)
-                    var currentSpeed = 0
-                    var mafGramsSec = 0.0
-                    parseMode01(sendCommand(output, input, "010D", 40))?.let { b ->
-                        if (b.size >= 3) currentSpeed = b[2]
+                    // 6. Velocità (010D) + Portata Aria MAF (0110) per Consumo Istantaneo
+                    parsePid(sendCommand(output, input, "010D", 45), "410D")?.let { b ->
+                        if (b.size >= 3) lastSpeed = b[2]
                     }
-                    parseMode01(sendCommand(output, input, "0110", 40))?.let { b ->
-                        if (b.size >= 4) mafGramsSec = ((b[2] * 256) + b[3]) / 100.0
-                    }
-                    kmPerLiter = if (currentSpeed > 2 && mafGramsSec > 0.1) {
-                        val litersPerHour = mafGramsSec * 0.3287
-                        (currentSpeed / litersPerHour).coerceIn(0.0, 50.0)
-                    } else {
-                        0.0
+                    parsePid(sendCommand(output, input, "0110", 45), "4110")?.let { b ->
+                        if (b.size >= 4) lastMafGramsSec = ((b[2] * 256) + b[3]) / 100.0
                     }
 
-                    // 5. Temperatura Aria Aspirata IAT (010F)
-                    parseMode01(sendCommand(output, input, "010F", 40))?.let { b ->
+                    if (lastMafGramsSec > 0.05) {
+                        val litersPerHour = lastMafGramsSec * 0.3287
+                        if (lastSpeed > 3) {
+                            val kml = (lastSpeed / litersPerHour).coerceIn(0.0, 50.0)
+                            fuelValueText = String.format(Locale.US, "%.1f", kml)
+                            fuelUnitText = "km/l"
+                        } else {
+                            fuelValueText = String.format(Locale.US, "%.1f", litersPerHour)
+                            fuelUnitText = "L/h"
+                        }
+                    }
+
+                    // 7. Temperatura Aria Aspirata IAT (010F)
+                    parsePid(sendCommand(output, input, "010F", 45), "410F")?.let { b ->
                         if (b.size >= 3) intakeTemp = b[2] - 40
                     }
 
-                    // 6. Carico Motore (0104)
-                    parseMode01(sendCommand(output, input, "0104", 40))?.let { b ->
+                    // 8. Carico Motore (0104)
+                    parsePid(sendCommand(output, input, "0104", 45), "4104")?.let { b ->
                         if (b.size >= 3) engineLoad = (b[2] * 100) / 255
                     }
 
-                    // 7. Temperatura Olio Motore (PID Mazda 221310 o Standard 015C)
-                    if (useExtendedOilPid) {
-                        val rawOil = sendCommand(output, input, "221310", 45)
-                        val parsedExt = parseMode22(rawOil, "621310")
-                        if (parsedExt != null && parsedExt.size >= 4) {
-                            val valC = ((parsedExt[3] * 256) + (parsedExt.getOrElse(4) { 0 })) / 100
-                            oilTemp = if (valC in -20..180) valC else (parsedExt[3] - 40)
-                        } else {
-                            useExtendedOilPid = false
-                        }
-                    } else {
-                        parseMode01(sendCommand(output, input, "015C", 40))?.let { b ->
-                            if (b.size >= 3) oilTemp = b[2] - 40
-                        }
-                    }
+                    loopCount++
                 }
             } catch (e: Exception) {
                 statusText = "Errore BT"
@@ -219,12 +229,14 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
         coolantTemp in 1..65 -> Color(0xFF29B6F6)
         else -> Color(0xFF80D8FF)
     }
-    val oilColor = when {
-        oilTemp >= 120 -> Color(0xFFFF1744)
-        oilTemp >= 110 -> Color(0xFFFFAB00)
-        oilTemp in 1..65 -> Color(0xFF29B6F6)
-        else -> Color(0xFFFF9100)
+    val trimColor = when {
+        abs(stft) >= 12.0 -> Color(0xFFFF1744)
+        abs(stft) >= 5.0 -> Color(0xFFFFAB00)
+        else -> Color(0xFF00E676)
     }
+
+    val stftFormatted = String.format(Locale.US, "%+.1f%%", stft)
+    val ltftFormatted = String.format(Locale.US, "LTFT: %+.1f%%", ltft)
 
     Column(
         modifier = Modifier
@@ -233,7 +245,6 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
             .padding(horizontal = 14.dp, vertical = 18.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Barra superiore: Stato e pulsanti
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -293,7 +304,6 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
             }
         }
 
-        // Barra LED Giri Motore
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -325,7 +335,7 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
             }
         }
 
-        // Riga 1: Temperatura Acqua + Temperatura Olio
+        // Riga 1: Temperatura Acqua + Correzione Carburante (STFT / LTFT)
         Row(
             modifier = Modifier.fillMaxWidth().weight(1f),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
@@ -337,9 +347,10 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
                 modifier = Modifier.weight(1f).fillMaxHeight()
             )
             GaugeBox(
-                title = "TEMP. OLIO",
-                value = if (oilTemp > -100) "$oilTemp°C" else "--°C",
-                valueColor = oilColor,
+                title = "CORR. CARBURANTE",
+                value = stftFormatted,
+                valueColor = trimColor,
+                sub = ltftFormatted,
                 modifier = Modifier.weight(1f).fillMaxHeight()
             )
         }
@@ -351,9 +362,9 @@ fun DashboardScreen(btAdapter: BluetoothAdapter?, sppUuid: UUID) {
         ) {
             GaugeBox(
                 title = "CONSUMO IST.",
-                value = if (kmPerLiter > 0.1) String.format(Locale.US, "%.1f", kmPerLiter) else "0.0",
+                value = fuelValueText,
                 valueColor = Color(0xFF00E676),
-                sub = "km/l",
+                sub = fuelUnitText,
                 modifier = Modifier.weight(1f).fillMaxHeight()
             )
             GaugeBox(
@@ -423,23 +434,11 @@ private suspend fun sendCommand(out: OutputStream, input: InputStream, cmd: Stri
     return sb.toString().replace("\\s".toRegex(), "")
 }
 
-private fun parseMode01(raw: String): List<Int>? {
-    val idx = raw.indexOf("41")
+private fun parsePid(raw: String, expectedHeader: String): List<Int>? {
+    val idx = raw.indexOf(expectedHeader)
     if (idx == -1) return null
     val hex = raw.substring(idx)
     if (hex.length < 6) return null
-    return try {
-        hex.chunked(2).map { it.toInt(16) }
-    } catch (_: Exception) {
-        null
-    }
-}
-
-private fun parseMode22(raw: String, header: String): List<Int>? {
-    val idx = raw.indexOf(header)
-    if (idx == -1) return null
-    val hex = raw.substring(idx)
-    if (hex.length < 8) return null
     return try {
         hex.chunked(2).map { it.toInt(16) }
     } catch (_: Exception) {
